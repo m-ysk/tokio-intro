@@ -1,28 +1,32 @@
 use crossbeam::channel;
 use futures::task;
 use futures::task::ArcWake;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 struct Delay {
     when: Instant,
+    waker: Option<Arc<Mutex<Waker>>>,
 }
 
 impl Future for Delay {
     type Output = &'static str;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
-        if Instant::now() >= self.when {
-            println!("Hello world");
-            Poll::Ready("done")
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
+        if let Some(waker) = &self.waker {
+            let mut waker = waker.lock().unwrap();
+
+            if !waker.will_wake(cx.waker()) {
+                *waker = cx.waker().clone();
+            }
         } else {
-            let waker = cx.waker().clone();
             let when = self.when;
+            let waker = Arc::new(Mutex::new(cx.waker().clone()));
+            self.waker = Some(waker.clone());
 
             thread::spawn(move || {
                 let now = Instant::now();
@@ -31,9 +35,16 @@ impl Future for Delay {
                     thread::sleep(when - now);
                 }
 
-                waker.wake();
+                let waker = waker.lock().unwrap();
+                waker.wake_by_ref();
             });
+        }
 
+        if Instant::now() >= self.when {
+            println!("Hello world");
+            Poll::Ready("done")
+        } else {
+            println!("Pending");
             Poll::Pending
         }
     }
@@ -44,7 +55,7 @@ fn main() {
 
     mini_tokio.spawn(async {
         let when = Instant::now() + Duration::from_secs(6);
-        let future = Delay { when };
+        let future = Delay { when, waker: None };
 
         let out = future.await;
         assert_eq!(out, "done");
@@ -52,7 +63,15 @@ fn main() {
 
     mini_tokio.spawn(async {
         let when = Instant::now() + Duration::from_secs(5);
-        let future = Delay { when };
+        let future = Delay { when, waker: None };
+
+        let out = future.await;
+        assert_eq!(out, "done");
+    });
+
+    mini_tokio.spawn(async {
+        let when = Instant::now() + Duration::from_secs(5);
+        let future = Delay { when, waker: None };
 
         let out = future.await;
         assert_eq!(out, "done");
@@ -80,7 +99,7 @@ impl Task {
     }
 
     fn schedule(self: &Arc<Self>) {
-        self.executor.send(self.clone());
+        let _ = self.executor.send(self.clone());
     }
 
     fn poll(self: Arc<Self>) {
